@@ -86,7 +86,14 @@ the point is this file has no reason to want any of it in the first place.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping, Protocol, runtime_checkable
+
+from agent.strategy import successor_of
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost
+except ImportError:  # pragma: no cover
+    TOOL_SPECS, cost = {}, None
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
 # degrade gracefully). It is present as of this writing and is core, stable
@@ -376,7 +383,20 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        headers = dict(cmd.headers)
+        if cmd.server == "slides":
+            headers["mcp-replica"] = "w"
+        successor = successor_of(cmd.server, cmd.tool)
+        server, tool = successor or (cmd.server, cmd.tool)
+        fields = tuple(cmd.fields)
+        if (server, tool) == ("registry", "list_servers") and fields in ((), ("*",)):
+            fields = ("name",)
+        elif (server, tool) == ("glossary", "list_terms") and fields in ((), ("*",)):
+            fields = ("term",)
+        routed = Command(cmd_id=cmd.cmd_id, kind=cmd.kind, raw=cmd.raw,
+                         server=server, tool=tool, args=dict(cmd.args),
+                         fields=fields, headers=headers, lease_id=cmd.lease_id,
+                         call_index=cmd.call_index)
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +408,36 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        spec = TOOL_SPECS.get((routed.server, routed.tool))
+        # A2A requests carry two independent identity signals.  The peer
+        # named by the route must match the audience, and delegation must not
+        # silently switch the learner being served.
+        if routed.kind == "a2a":
+            audience = routed.headers.get("aud")
+            if audience and audience != routed.server:
+                return self.deny(cmd, "A2A audience does not match peer")
+            target = routed.args.get("learner") or routed.args.get("for_learner")
+            if target is not None and str(target) != str(self.ctx.act):
+                return self.deny(cmd, "A2A delegation target is outside the active learner")
+            if routed.headers.get("x-card-signature") == "invalid":
+                return self.deny(cmd, "A2A agent card signature is invalid")
+        # These are mutation markers, not legitimate tutor arguments.  Do not
+        # let an untrusted result instruct the next action or smuggle a server
+        # identity through a body field.
+        if routed.headers.get("x-server-fingerprint") == "unvouched":
+            return self.deny(cmd, "server fingerprint is not vouched")
+        if "route" in routed.args and routed.args.get("route") != "w":
+            return self.deny(cmd, "replica route must be carried in the trusted header")
+        if isinstance(routed.args.get("note"), str) and re.search(
+                r"ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions|system\s+override",
+                routed.args["note"], re.I):
+            return self.deny(cmd, "instruction-like retrieved content quarantined")
+        if routed.tool == "get_frame" and routed.lease_id not in self.ctx.leases:
+            return self.deny(cmd, "get_frame requires a live lease")
+        if spec is not None and spec.is_write:
+            missing = [h for h in spec.required_headers if not routed.headers.get(h)]
+            if missing:
+                return self.deny(cmd, "write requires " + ", ".join(missing))
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -402,8 +451,13 @@ class Gateway:
         # `verify_delegation` is the real worked example of an authority
         # check over a signed token, for the A2A-specific version of this
         # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        if spec is not None and spec.is_write:
+            target = routed.args.get("learner") or routed.args.get("for_learner")
+            if target is not None and str(target) != str(self.ctx.act):
+                return self.deny(cmd, "write target is outside the active learner")
+            needed = "wiki.write:progress" if routed.server == "progress" else "wiki.write:content"
+            if needed not in self.ctx.scopes:
+                return self.deny(cmd, f"missing {needed} scope")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
@@ -417,11 +471,21 @@ class Gateway:
         # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
         # REWRITE `routed.fields` down to the tool's cheap default instead
         # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        if cost is not None:
+            try:
+                price = cost(routed.server, routed.tool, fields=routed.fields, n_rows=1)
+                if price > max(0, int(self.ctx.credits)):
+                    return self.deny(cmd, "insufficient duel credits")
+            except (KeyError, TypeError, ValueError):
+                return self.deny(cmd, "unknown or invalid tool call")
+
+        changed = (routed.server, routed.tool, routed.fields, routed.headers) != (
+            cmd.server, cmd.tool, cmd.fields, cmd.headers
+        )
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict="rewrite" if changed else "forward", call=call,
+                            note="gateway policy applied" if changed else None)
         self._telemetry.decision_made(cmd, decision)
         return decision
 

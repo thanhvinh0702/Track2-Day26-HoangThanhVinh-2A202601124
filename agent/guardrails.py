@@ -177,7 +177,16 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    haystack = str(text or "")
+    patterns = (
+        r"\bignore\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b",
+        r"\b(?:system|developer)\s+(?:override|message|prompt)\b",
+        r"\b(?:you\s+)?must\s+(?:now\s+)?(?:reveal|disclose|report)\b",
+        r"\b(?:reveal|disclose)\s+(?:the\s+)?(?:private|secret|grading|key|act|scope)\b",
+        r"\bnew\s+system\s+prompt\b",
+    )
+    matched = tuple(p for p in patterns if re.search(p, haystack, re.I))
+    return InjectionScanResult(bool(matched), matched)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +214,17 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    value = str(text or "")
+    hits: list[str] = []
+    private = re.compile(
+        r"(?is)(?P<label>private\s+(?:note|field|content)(?:\s+reads?)?)\s*[:=]\s*"
+        r"(?P<body>[^\n.;]{40,}(?:\.|$))"
+    )
+    def replace(match: re.Match[str]) -> str:
+        body = match.group("body").strip()
+        hits.append(body)
+        return f"{match.group('label')}: [REDACTED]"
+    return RedactionResult(private.sub(replace, value), tuple(hits))
 
 
 # ---------------------------------------------------------------------------
